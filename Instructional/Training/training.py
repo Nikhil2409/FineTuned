@@ -1,8 +1,4 @@
-import time
-import tiktoken
-import torch
-import re
-import os
+import os, re, time, torch, tiktoken
 from Instructional.model import model, CHOOSE_MODEL, BASE_CONFIG
 from Instructional.Training.functions import train_model_simple
 from Instructional.Data.format import format_input
@@ -10,15 +6,17 @@ from Instructional.Data.data_loader import train_loader, val_loader, val_data, t
 from Instructional.Accuracy.post_training import post_training_generate
 
 start_time = time.time()
-
 torch.manual_seed(123)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 🔹 Checkpoint path inside Instructional/Training
-checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
-checkpoint_path = os.path.join("Instructional", "Training", checkpoint_name)
+# 🔹 Save to Google Drive so it persists
+base_dir = "/content/drive/MyDrive/Finetuned_checkpoints"
+os.makedirs(base_dir, exist_ok=True)
 
-# 🔹 If continuing training, reload weights
+checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
+checkpoint_path = os.path.join(base_dir, checkpoint_name)
+
+# Load checkpoint if available
 try:
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     print(f"Loaded checkpoint: {checkpoint_path}")
@@ -30,9 +28,7 @@ model = model.to(device)
 tokenizer = tiktoken.get_encoding("gpt2")
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.1)
 
-# 🔹 Train for more epochs
-num_epochs = 1   # run another epoch
-
+num_epochs = 1
 train_losses, val_losses, tokens_seen = train_model_simple(
     model, train_loader, val_loader, optimizer, device,
     num_epochs=num_epochs, eval_freq=5, eval_iter=5,
@@ -43,13 +39,13 @@ train_losses, val_losses, tokens_seen = train_model_simple(
 end_time = time.time()
 execution_time_minutes = (end_time - start_time) / 60
 
-# 🔹 Save checkpoint in Instructional/Training
 torch.save(model.state_dict(), checkpoint_path)
 print(f"Model saved as {checkpoint_path}")
 print(f"Training completed in {execution_time_minutes:.2f} minutes.")
 
-# 🔹 Save responses inside Instructional/Accuracy/
+# 🔹 Save responses also in Drive
 output_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-responses.json"
-test_data = post_training_generate(
-    model, tokenizer, device, test_data
-)
+output_path = os.path.join(base_dir, output_name)
+test_data = post_training_generate(model, tokenizer, device, test_data)
+
+print(f"Responses saved at {output_path}")

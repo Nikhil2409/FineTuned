@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Large model data
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.csv
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Colab and local artifacts
+.colab/
+
+# Exclude GPT-2 preloaded weights folder
+gpt2/

@@ -4,32 +4,39 @@ from Instructional.Training.generate_text import generate
 from GPT_Model.functions import text_to_token_ids, token_ids_to_text
 from torch.cuda.amp import autocast, GradScaler
 
+import os
+import torch
+from torch.cuda.amp import autocast, GradScaler
+
 def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
-                       eval_freq, eval_iter, start_context, tokenizer,
-                       grad_accum_steps=4):  # New argument for gradient accumulation
-    # Initialize lists to track losses and tokens seen
+                       eval_freq, eval_iter, start_context, tokenizer, checkpoint_path, 
+                       grad_accum_steps=4):
     train_losses, val_losses, track_tokens_seen = [], [], []
     tokens_seen, global_step = 0, -1
-    scaler = GradScaler()  # For mixed precision FP16
+    scaler = GradScaler()
 
-    # Main training loop
+    # 🔹 New: Initialize a variable to track the best validation loss
+    best_val_loss = float('inf')
+    
+    # 🔹 The path to save the best model checkpoint
+    # Assumes checkpoint_path is passed in or defined in the calling scope
+    # For your training.py, this would be:
+    # checkpoint_path = f"/content/drive/MyDrive/Finetuned_checkpoints/{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
+
     for epoch in range(num_epochs):
-        model.train()  # Set model to training mode
+        model.train()
         optimizer.zero_grad()
 
         for step, (input_batch, target_batch) in enumerate(train_loader):
             input_batch = input_batch.to(device)
             target_batch = target_batch.to(device)
 
-            # FP16 mixed precision
             with autocast():
                 loss = calc_loss_batch(input_batch, target_batch, model, device)
-                loss = loss / grad_accum_steps  # Scale loss for accumulation
+                loss = loss / grad_accum_steps
 
-            # Backpropagation
             scaler.scale(loss).backward()
 
-            # Gradient accumulation
             if (step + 1) % grad_accum_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
@@ -38,7 +45,6 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
             tokens_seen += input_batch.numel()
             global_step += 1
 
-            # Optional evaluation
             if global_step % eval_freq == 0:
                 train_loss, val_loss = evaluate_model(
                     model, train_loader, val_loader, device, eval_iter)
@@ -48,13 +54,18 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                 print(f"Ep {epoch+1} (Step {global_step:06d}): "
                       f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
 
-        # Print a sample text after each epoch
+                # 🔹 New: Check for validation loss improvement and save the model
+                if val_loss < best_val_loss:
+                    print(f"Validation loss improved from {best_val_loss:.3f} to {val_loss:.3f}. Saving checkpoint.")
+                    best_val_loss = val_loss
+                    # Assuming `checkpoint_path` is available in the outer scope
+                    torch.save(model.state_dict(), checkpoint_path)
+
         generate_and_print_sample(
             model, tokenizer, device, start_context
         )
 
     return train_losses, val_losses, track_tokens_seen
-
 # -----------------------------
 # Helper functions remain the same
 # -----------------------------

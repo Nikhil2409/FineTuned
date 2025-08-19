@@ -26,8 +26,7 @@ def download_and_load_file(file_path, url):
 # Save in Instructional/Data folder
 file_path = os.path.join("Instructional", "Data", "instruction-data.json")
 url = (
-    "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch"
-    "/main/ch07/01_main-chapter-code/instruction-data.json"
+    "https://huggingface.co/datasets/Tural/stanford_alpaca"
 )
 
 data = download_and_load_file(file_path, url)

@@ -28,18 +28,19 @@ model = model.to(device)
 tokenizer = tiktoken.get_encoding("gpt2")
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.1)
 
-num_epochs = 1
+num_epochs = 5
 train_losses, val_losses, tokens_seen = train_model_simple(
     model, train_loader, val_loader, optimizer, device,
     num_epochs=num_epochs, eval_freq=5, eval_iter=5,
     start_context=format_input(val_data[0]), tokenizer=tokenizer,
+    checkpoint_path=checkpoint_path,
     grad_accum_steps=4
 )
 
 end_time = time.time()
 execution_time_minutes = (end_time - start_time) / 60
 
-torch.save(model.state_dict(), checkpoint_path)
+# The `train_model_simple` function now handles saving the best model.
 print(f"Model saved as {checkpoint_path}")
 print(f"Training completed in {execution_time_minutes:.2f} minutes.")
 

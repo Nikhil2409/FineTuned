@@ -1,40 +1,31 @@
 import json
-import os
-import urllib.request
-import ssl
+from datasets import load_dataset
 
-def download_and_load_file(file_path, url):
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
+# 🔹 Load the dataset
+data = load_dataset("Tural/stanford_alpaca")
+full_dataset = data['train']
 
-    if not os.path.exists(file_path):
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with urllib.request.urlopen(url, context=ssl_context) as response:
-            text_data = response.read().decode("utf-8")
-        with open(file_path, "w", encoding="utf-8") as file:
-            file.write(text_data)
-    else:
-        with open(file_path, "r", encoding="utf-8") as file:
-            text_data = file.read()
+# 🔹 Split: 85% train, 15% test → then split test into test+val
+train_test_split = full_dataset.train_test_split(test_size=0.15, seed=42)
+test_val_split = train_test_split['test'].train_test_split(test_size=0.33, seed=42)
 
-    with open(file_path, "r", encoding="utf-8") as file:
-        data = json.load(file)
+# Assign splits
+train_data = train_test_split['train']
+test_data = test_val_split['train']
+val_data = test_val_split['test']
 
-    return data
+# 🔹 Save JSONs
+with open("train_data.json", "w") as f:
+    json.dump(train_data.to_list(), f)
 
-# Save in Instructional/Data folder
-file_path = os.path.join("Instructional", "Data", "instruction-data.json")
-url = (
-    "https://huggingface.co/datasets/Tural/stanford_alpaca"
-)
+with open("val_data.json", "w") as f:
+    json.dump(val_data.to_list(), f)
 
-data = download_and_load_file(file_path, url)
+with open("test_data.json", "w") as f:
+    json.dump(test_data.to_list(), f)
 
-train_portion = int(len(data) * 0.85)  # 85% for training
-test_portion = int(len(data) * 0.1)    # 10% for testing
-val_portion = len(data) - train_portion - test_portion  # Remaining 5% for validation
-
-train_data = data[:train_portion]
-test_data = data[train_portion:train_portion + test_portion]
-val_data = data[train_portion + test_portion:]
+# 🔹 Print sizes
+print(f"Total dataset size: {len(full_dataset)}")
+print(f"Training data size: {len(train_data)}")
+print(f"Validation data size: {len(val_data)}")
+print(f"Testing data size: {len(test_data)}")

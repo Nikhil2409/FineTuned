@@ -46,8 +46,8 @@ def generate_model_scores(json_data, json_key, model="llama3"):
 # 🔹 Config
 config = dotenv_values(".env")
 # Replace this with the specific ID of your instruction-data-with-response.json file
-json_file_id = config.JSON_FILE_ID
-local_path = config.LOCAL_PATH
+json_file_id = config.get("JSON_FILE_ID")
+local_path = config.get("LOCAL_PATH")
 
 # 🔹 Download the JSON file
 download_single_file(json_file_id, local_path)

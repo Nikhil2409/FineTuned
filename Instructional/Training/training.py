@@ -87,7 +87,7 @@ print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}, Test siz
 # ---------------------- Checkpoint ----------------------
 base_dir = "/content/drive/MyDrive/Finetuned_checkpoints"
 os.makedirs(base_dir, exist_ok=True)
-checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft-lora.pth"
+checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
 checkpoint_path = os.path.join(base_dir, checkpoint_name)
 
 # ---------------------- Optimizer ----------------------

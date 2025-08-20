@@ -1,10 +1,10 @@
 import os, re, time, torch, tiktoken, json
 from functools import partial
 from torch.utils.data import DataLoader
+from Instructional.Training.functions import train_model_simple
 from Instructional.model import model, CHOOSE_MODEL, BASE_CONFIG
 from Instructional.Data.data_set import InstructionDataset
 from Instructional.Data.collate import custom_collate_fn
-from Instructional.Training.functions import train_model_simple
 from Instructional.Data.format import format_input
 from Instructional.Accuracy.post_training import post_training_generate
 
@@ -30,12 +30,12 @@ test_dataset = InstructionDataset(test_data_json, tokenizer)
 
 # 🔹 DataLoaders
 customized_collate_fn = partial(custom_collate_fn, device=device, allowed_max_length=1024)
-batch_size = 2
+batch_size = 4
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                           drop_last=True, num_workers=0, collate_fn=customized_collate_fn)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                        drop_last=False, num_workers=0, collate_fn=customized_collate_fn)
+                         drop_last=False, num_workers=0, collate_fn=customized_collate_fn)
 
 # 🔹 Check dataset sizes
 print(f"Train size: {len(train_dataset)}")
@@ -49,17 +49,21 @@ checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
 checkpoint_path = os.path.join(base_dir, checkpoint_name)
 
 # 🔹 Load checkpoint if available (resume training)
-#try:
-#    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-#   print(f"Loaded checkpoint: {checkpoint_path}")
-#except FileNotFoundError:
-#   print("No checkpoint found, training from scratch.")
+best_val_loss = float('inf')
+try:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.5) # Initialize optimizer
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    best_val_loss = checkpoint['best_val_loss']
+    print(f"Loaded checkpoint from {checkpoint_path} with best validation loss: {best_val_loss:.3f}")
+except FileNotFoundError:
+    print("No checkpoint found, training from scratch.")
+    # 🔹 Optimizer (initialized here if no checkpoint is found)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.5)
 
 # 🔹 Move model to device
 model = model.to(device)
-
-# 🔹 Optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.5)
 
 # 🔹 Train
 start_time = time.time()
@@ -70,20 +74,24 @@ train_losses, val_losses, tokens_seen = train_model_simple(
     num_epochs=num_epochs, eval_freq=5, eval_iter=5,
     start_context=format_input(val_data_json[0]), tokenizer=tokenizer,
     checkpoint_path=checkpoint_path,
-    grad_accum_steps=8
+    grad_accum_steps=4,
+    best_val_loss=best_val_loss # Pass the loaded best loss
 )
 end_time = time.time()
 print(f"Training completed in {(end_time - start_time)/60:.2f} minutes.")
 
-# 🔹 Load best checkpoint for post-training generation
+# 🔹 Load the best checkpoint for post-training generation
 try:
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    print(f"Loaded best checkpoint for post-training generation.")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print("✅ Loaded best checkpoint for post-training generation.")
 except FileNotFoundError:
-    print("Best checkpoint not found. Using the last trained model.")
+    print("⚠️ No model checkpoint exists (training likely never ran).")
 
 # 🔹 Generate responses
 output_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-responses.json"
 output_path = os.path.join(base_dir, output_name)
 test_data_json = post_training_generate(model, tokenizer, device, test_data_json)
+with open(output_path, "w") as f:
+    json.dump(test_data_json, f, indent=4)
 print(f"Responses saved at {output_path}")

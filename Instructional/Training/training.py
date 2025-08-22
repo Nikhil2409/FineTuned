@@ -2,6 +2,7 @@ import os, re, time, math, torch, tiktoken, json
 from functools import partial
 from torch.utils.data import DataLoader
 import torch.nn as nn
+from google.colab import drive
 
 from Instructional.Training.functions import train_model_simple
 from Instructional.model import GPTModel, CHOOSE_MODEL, BASE_CONFIG
@@ -9,6 +10,9 @@ from Instructional.Data.data_set import InstructionDataset
 from Instructional.Data.collate import custom_collate_fn
 from Instructional.Data.format import format_input
 from Instructional.Accuracy.post_training import post_training_generate
+
+# PEFT LoRA imports
+from peft import PeftModel
 
 # ---------------------- Device & Seed ----------------------
 torch.manual_seed(123)
@@ -26,16 +30,13 @@ class LoRALinear(nn.Module):
         self.r = r
         self.alpha = alpha
 
-        # Frozen weight
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         self.weight.requires_grad = False
 
-        # Trainable LoRA matrices
         self.A = nn.Parameter(torch.randn(r, in_features) * 0.01)
         self.B = nn.Parameter(torch.randn(out_features, r) * 0.01)
 
-        # Optional bias
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         self.scaling = self.alpha / self.r
 
@@ -43,10 +44,29 @@ class LoRALinear(nn.Module):
         return nn.functional.linear(x, self.weight, self.bias) + \
                self.scaling * nn.functional.linear(x, self.B @ self.A)
 
-# ---------------------- Initialize Fresh Model ----------------------
+# ---------------------- Initialize Model ----------------------
 model = GPTModel(BASE_CONFIG)
 
-# ---------------------- LoRA Replacement ----------------------
+# ---------------------- Load Checkpoint Before LoRA ----------------------
+best_val_loss = float('inf')
+checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
+checkpoint_path = os.path.join("/content/drive/MyDrive/Finetuned_checkpoints", checkpoint_name)
+backup_checkpoint_path = checkpoint_path.replace('.pth', '_backup.pth')
+
+checkpoint_loaded = False
+for path in [checkpoint_path, backup_checkpoint_path]:
+    if os.path.exists(path):
+        checkpoint = torch.load(path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        print(f"✅ Loaded checkpoint: {path} with best val loss: {best_val_loss:.3f}")
+        checkpoint_loaded = True
+        break
+
+if not checkpoint_loaded:
+    print("No checkpoint found, training from scratch.")
+
+# ---------------------- Apply LoRA Replacement ----------------------
 for block in model.trf_blocks:
     if isinstance(block.att.W_query, nn.Linear):
         block.att.W_query = LoRALinear(block.att.W_query.in_features, block.att.W_query.out_features)
@@ -57,10 +77,21 @@ for block in model.trf_blocks:
     if isinstance(block.att.out_proj, nn.Linear):
         block.att.out_proj = LoRALinear(block.att.out_proj.in_features, block.att.out_proj.out_features)
 
-# ---------------------- Freeze Non-LoRA Params ----------------------
+# Freeze all non-LoRA parameters
 for name, param in model.named_parameters():
     if "A" not in name and "B" not in name:
         param.requires_grad = False
+
+# ---------------------- Optimizer ----------------------
+optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                             lr=5e-4, weight_decay=0.01)
+
+# Move model and optimizer states to device
+model = model.to(device)
+for state in optimizer.state.values():
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            state[k] = v.to(device)
 
 # ---------------------- Load Dataset ----------------------
 with open("train_data.json", "r") as f:
@@ -84,30 +115,6 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
 
 print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}, Test size: {len(test_dataset)}")
 
-# ---------------------- Checkpoint ----------------------
-base_dir = "/content/drive/MyDrive/Finetuned_checkpoints"
-os.makedirs(base_dir, exist_ok=True)
-checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
-checkpoint_path = os.path.join(base_dir, checkpoint_name)
-
-# ---------------------- Optimizer ----------------------
-optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                              lr=5e-4, weight_decay=0.01)
-
-# ---------------------- Load Checkpoint ----------------------
-best_val_loss = float('inf')
-if os.path.exists(checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    best_val_loss = checkpoint['best_val_loss']
-    print(f"✅ Loaded checkpoint from {checkpoint_path} with best val loss: {best_val_loss:.3f}")
-else:
-    print("No checkpoint found, training from scratch.")
-
-# ---------------------- Move model to device ----------------------
-model = model.to(device)
-
 # ---------------------- Train ----------------------
 start_time = time.time()
 num_epochs = 5
@@ -123,17 +130,9 @@ end_time = time.time()
 print(f"Training completed in {(end_time - start_time)/60:.2f} minutes.")
 
 # ---------------------- Post-Training Generation ----------------------
-if os.path.exists(checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print("✅ Loaded best checkpoint for generation.")
-else:
-    print("⚠️ No checkpoint found.")
-
 output_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-responses.json"
-output_path = os.path.join(base_dir, output_name)
+output_path = os.path.join("/content/drive/MyDrive/Finetuned_checkpoints", output_name)
 test_data_json = post_training_generate(model, tokenizer, device, test_data_json)
-
 with open(output_path, "w") as f:
     json.dump(test_data_json, f, indent=4)
 print(f"Responses saved at {output_path}")

@@ -7,19 +7,33 @@ def calc_loss_batch(input_batch, target_batch, model, device):
 
 
 def calc_loss_loader(data_loader, model, device, num_batches=None):
-    total_loss = 0.
-    if len(data_loader) == 0:
-        return float("nan")
-    elif num_batches is None:
-        num_batches = len(data_loader)
-    else:
-        # Reduce the number of batches to match the total number of batches in the data loader
-        # if num_batches exceeds the number of batches in the data loader
-        num_batches = min(num_batches, len(data_loader))
-    for i, (input_batch, target_batch) in enumerate(data_loader):
-        if i < num_batches:
+    total_loss = 0.0
+    num_batches_processed = 0
+    # Use an iterator to handle an unknown number of batches
+    data_iterator = iter(data_loader)
+
+    while True:
+        # Stop the loop if we've processed the desired number of batches
+        if num_batches is not None and num_batches_processed >= num_batches:
+            break
+        
+        try:
+            # Get the next batch from the iterator
+            input_batch, target_batch = next(data_iterator)
+        except StopIteration:
+            # Break the loop if the data loader is exhausted
+            break
+        
+        input_batch = input_batch.to(device)
+        target_batch = target_batch.to(device)
+        
+        with torch.no_grad():
             loss = calc_loss_batch(input_batch, target_batch, model, device)
             total_loss += loss.item()
-        else:
-            break
-    return total_loss / num_batches
+            num_batches_processed += 1
+
+    if num_batches_processed > 0:
+        return total_loss / num_batches_processed
+    else:
+        # Return 0 or handle the case where no batches were processed
+        return 0.0

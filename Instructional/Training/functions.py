@@ -1,12 +1,17 @@
-from Instructional.Training.loss import calc_loss_batch, calc_loss_loader
+# Imports for this specific file
 import torch
-from Instructional.Training.generate_text import generate
-from GPT_Model.functions import text_to_token_ids, token_ids_to_text
+import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
+from GPT_Model.functions import text_to_token_ids, token_ids_to_text
+from Instructional.Training.generate_text import generate
+from Instructional.Training.loss import calc_loss_batch, calc_loss_loader
+# Note: Assuming the `GPT_Model.functions` and `Instructional.Training.loss`
+# modules are correctly set up and available in your environment.
+
 
 def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
-                       eval_freq, eval_iter, start_context, tokenizer, checkpoint_path, 
-                       grad_accum_steps=4, best_val_loss=float('inf')):
+                        eval_freq, eval_iter, start_context, tokenizer, checkpoint_path, 
+                        grad_accum_steps=4, best_val_loss=float('inf')):
     train_losses, val_losses, track_tokens_seen = [], [], []
     tokens_seen, global_step = 0, -1
     scaler = GradScaler()
@@ -17,10 +22,18 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
 
         for step, (input_batch, target_batch) in enumerate(train_loader):
             input_batch = input_batch.to(device)
-            target_batch = target_batch.to(device)
+
+            # The model's inputs are all but the last token.
+            inputs = input_batch[:, :-1]
+            # The targets are all but the first token,
+            # which are the tokens the model should predict.
+            targets = input_batch[:, 1:]
 
             with autocast():
-                loss = calc_loss_batch(input_batch, target_batch, model, device)
+                # Pass only the inputs to the model.
+                outputs = model(inputs)
+                # Calculate the loss on the correct outputs and targets.
+                loss = calc_loss_batch(outputs, targets)
                 loss = loss / grad_accum_steps
 
             scaler.scale(loss).backward()
@@ -74,6 +87,7 @@ def generate_and_print_sample(model, tokenizer, device, start_context):
     print(decoded_text.replace("\n", " "))
     model.train()
 
+
 def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     model.eval()
     with torch.no_grad():
@@ -81,3 +95,5 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iter):
         val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
     model.train()
     return train_loss, val_loss
+
+

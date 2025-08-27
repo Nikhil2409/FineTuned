@@ -2,8 +2,8 @@ import os, re, time, math, torch, tiktoken, json
 from functools import partial
 from torch.utils.data import DataLoader
 import torch.nn as nn
+import atexit 
 from google.colab import drive
-
 from Instructional.Training.functions import train_model_simple
 from Instructional.model import GPTModel, CHOOSE_MODEL, BASE_CONFIG
 from Instructional.Data.data_set import InstructionDataset
@@ -47,44 +47,67 @@ class LoRALinear(nn.Module):
 # ---------------------- Initialize Model ----------------------
 model = GPTModel(BASE_CONFIG)
 
-# ---------------------- Load Checkpoint Before LoRA ----------------------
-best_val_loss = float('inf')
-checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
-checkpoint_path = os.path.join("/content/drive/MyDrive/Finetuned_checkpoints", checkpoint_name)
-backup_checkpoint_path = checkpoint_path.replace('.pth', '_backup.pth')
+# ---------------------- Checkpoint Paths ----------------------
+base_dir = "/content/drive/MyDrive/Finetuned_checkpoints"
+os.makedirs(base_dir, exist_ok=True)
 
+best_checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft.pth"
+best_checkpoint_path = os.path.join(base_dir, best_checkpoint_name)
+backup_checkpoint_path = best_checkpoint_path.replace('.pth', '-backup.pth')
+
+best_val_loss = float('inf')
 checkpoint_loaded = False
-for path in [checkpoint_path, backup_checkpoint_path]:
-    if os.path.exists(path):
-        checkpoint = torch.load(path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+
+optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                             lr=5e-4, weight_decay=0.01)
+
+# 🔹 Updated Logic: Separate loading for backup and best checkpoints
+if os.path.exists(backup_checkpoint_path):
+    try:
+        checkpoint = torch.load(backup_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("✅ Successfully loaded optimizer state from backup.")
+        except (KeyError, ValueError) as e:
+            print(f"❗ Warning: Could not load optimizer state from backup. Starting with fresh optimizer. Reason: {e}")
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        print(f"✅ Loaded checkpoint: {path} with best val loss: {best_val_loss:.3f}")
+        print(f"✅ Loaded backup checkpoint: {backup_checkpoint_path} with best val loss: {best_val_loss:.3f}")
         checkpoint_loaded = True
-        break
+    except Exception as e:
+        print(f"Error loading backup checkpoint: {e}")
+
+if not checkpoint_loaded and os.path.exists(best_checkpoint_path):
+    try:
+        checkpoint = torch.load(best_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        print(f"✅ Loaded best checkpoint: {best_checkpoint_path} with best val loss: {best_val_loss:.3f}")
+        checkpoint_loaded = True
+    except Exception as e:
+        print(f"Error loading best checkpoint: {e}")
 
 if not checkpoint_loaded:
     print("No checkpoint found, training from scratch.")
 
 # ---------------------- Apply LoRA Replacement ----------------------
-for block in model.trf_blocks:
-    if isinstance(block.att.W_query, nn.Linear):
-        block.att.W_query = LoRALinear(block.att.W_query.in_features, block.att.W_query.out_features)
-    if isinstance(block.att.W_key, nn.Linear):
-        block.att.W_key = LoRALinear(block.att.W_key.in_features, block.att.W_key.out_features)
-    if isinstance(block.att.W_value, nn.Linear):
-        block.att.W_value = LoRALinear(block.att.W_value.in_features, block.att.W_value.out_features)
-    if isinstance(block.att.out_proj, nn.Linear):
-        block.att.out_proj = LoRALinear(block.att.out_proj.in_features, block.att.out_proj.out_features)
+# 🔹 New Logic: Only apply LoRA if a backup was NOT loaded.
+# This ensures we don't double-apply it.
+if not os.path.exists(backup_checkpoint_path):
+  for block in model.trf_blocks:
+      if isinstance(block.att.W_query, nn.Linear):
+          block.att.W_query = LoRALinear(block.att.W_query.in_features, block.att.W_query.out_features)
+      if isinstance(block.att.W_key, nn.Linear):
+          block.att.W_key = LoRALinear(block.att.W_key.in_features, block.att.W_key.out_features)
+      if isinstance(block.att.W_value, nn.Linear):
+          block.att.W_value = LoRALinear(block.att.W_value.in_features, block.att.W_value.out_features)
+      if isinstance(block.att.out_proj, nn.Linear):
+          block.att.out_proj = LoRALinear(block.att.out_proj.in_features, block.att.out_proj.out_features)
 
 # Freeze all non-LoRA parameters
 for name, param in model.named_parameters():
     if "A" not in name and "B" not in name:
         param.requires_grad = False
-
-# ---------------------- Optimizer ----------------------
-optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                             lr=5e-4, weight_decay=0.01)
 
 # Move model and optimizer states to device
 model = model.to(device)
@@ -93,13 +116,31 @@ for state in optimizer.state.values():
         if isinstance(v, torch.Tensor):
             state[k] = v.to(device)
 
+# ---------------------- Backup Save Function ----------------------
+def backup_save():
+    print("\n❗ Detected interruption. Saving backup checkpoint...")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_val_loss': best_val_loss,
+    }, backup_checkpoint_path)
+    print(f"✅ Backup saved to: {backup_checkpoint_path}")
+
+atexit.register(backup_save)
+
 # ---------------------- Load Dataset ----------------------
-with open("train_data.json", "r") as f:
-    train_data_json = json.load(f)
-with open("val_data.json", "r") as f:
-    val_data_json = json.load(f)
-with open("test_data.json", "r") as f:
-    test_data_json = json.load(f)
+try:
+    with open("train_data.json", "r") as f:
+        train_data_json = json.load(f)
+    with open("val_data.json", "r") as f:
+        val_data_json = json.load(f)
+    with open("test_data.json", "r") as f:
+        test_data_json = json.load(f)
+    print("✅ Successfully loaded data from JSON files.")
+except FileNotFoundError:
+    raise FileNotFoundError(
+        "Data JSON files not found. Please run data_setup.py first to create them."
+    )
 
 train_dataset = InstructionDataset(train_data_json, tokenizer)
 val_dataset = InstructionDataset(val_data_json, tokenizer)
@@ -117,22 +158,42 @@ print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}, Test siz
 
 # ---------------------- Train ----------------------
 start_time = time.time()
-num_epochs = 5
-train_losses, val_losses, tokens_seen = train_model_simple(
-    model, train_loader, val_loader, optimizer, device,
-    num_epochs=num_epochs, eval_freq=5, eval_iter=5,
-    start_context=format_input(val_data_json[0]), tokenizer=tokenizer,
-    checkpoint_path=checkpoint_path,
-    grad_accum_steps=4,
-    best_val_loss=best_val_loss
-)
+num_epochs = 10
+try:
+    train_losses, val_losses, tokens_seen = train_model_simple(
+        model, train_loader, val_loader, optimizer, device,
+        num_epochs=num_epochs, eval_freq=50, eval_iter=5,
+        start_context=format_input(val_data_json[0]), tokenizer=tokenizer,
+        checkpoint_path=best_checkpoint_path, # 🔹 Use the 'best' checkpoint path
+        grad_accum_steps=4,
+        best_val_loss=best_val_loss
+    )
+finally:
+    backup_save()
 end_time = time.time()
 print(f"Training completed in {(end_time - start_time)/60:.2f} minutes.")
 
 # ---------------------- Post-Training Generation ----------------------
+final_val_loss = val_losses[-1] if val_losses else float('inf')
+
+if final_val_loss < best_val_loss:
+    best_model_for_generation_path = best_checkpoint_path
+    print(f"✅ Final model is an improvement. Using {best_model_for_generation_path} for generation.")
+else:
+    best_model_for_generation_path = best_checkpoint_path
+    print(f"✅ Final validation loss ({final_val_loss:.3f}) is not an improvement over best loss ({best_val_loss:.3f}). Using best checkpoint.")
+
+try:
+    model.load_state_dict(torch.load(best_model_for_generation_path, map_location=device)['model_state_dict'])
+    print(f"✅ Loaded {best_model_for_generation_path} for post-training generation.")
+except FileNotFoundError:
+    print(f"Error: Could not find model at {best_model_for_generation_path}. Exiting.")
+    exit()
+
 output_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-responses.json"
-output_path = os.path.join("/content/drive/MyDrive/Finetuned_checkpoints", output_name)
+output_path = os.path.join(base_dir, output_name)
 test_data_json = post_training_generate(model, tokenizer, device, test_data_json)
 with open(output_path, "w") as f:
     json.dump(test_data_json, f, indent=4)
 print(f"Responses saved at {output_path}")
+

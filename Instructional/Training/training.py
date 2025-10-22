@@ -1,22 +1,32 @@
-import os, re, time, math, torch, tiktoken, json
+import os, re, math, torch, tiktoken, json, time
 from functools import partial
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import atexit
-from google.colab import drive
+# --- TENSORBOARD IMPORT ---
+from torch.utils.tensorboard import SummaryWriter
+import torch.cuda
+# --------------------------
+
+# --- IMPORTS FROM OTHER FILES (Assumed to be in Python path) ---
 from Instructional.Training.functions import train_model_simple
-from Instructional.Training.loss import calc_loss_batch, calc_loss_loader
 from Instructional.model import GPTModel, CHOOSE_MODEL, BASE_CONFIG
 from Instructional.Data.data_set import InstructionDataset
 from Instructional.Data.collate import custom_collate_fn
 from Instructional.Data.format import format_input
 from Instructional.Accuracy.post_training import post_training_generate
+# -------------------------------------------------------------
 
-# PEFT LoRA imports
-from peft import PeftModel
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+except ModuleNotFoundError:
+    print("Running outside Colab — skipping Google Drive mount.")
 
+# --- CONFIGURATION FOR TENSORBOARD RUNS ---
+BASE_EXPERIMENT_NAME = f"LLM_FineTuning_Comparison"
+STAGE1_RUN_NAME = "Full_FineTuning_SFT"
+STAGE2_RUN_NAME = "LoRA_PEFT_Final_Tune"
 # ---------------------- Device & Seed ----------------------
 torch.manual_seed(123)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -42,158 +52,37 @@ class LoRALinear(nn.Module):
 
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         self.scaling = self.alpha / self.r
-
     def forward(self, x):
         return nn.functional.linear(x, self.weight, self.bias) + \
                self.scaling * nn.functional.linear(x, self.B @ self.A)
 
-# ---------------------- Checkpoint Paths ----------------------
 base_dir = "/content/drive/MyDrive/Finetuned_checkpoints"
 os.makedirs(base_dir, exist_ok=True)
 
-# Checkpoint for the end of Stage 1, now also used as the backup
+# Checkpoint paths
 stage1_checkpoint_name = f"{re.sub(r'[ ()]', '', CHOOSE_MODEL)}-sft-stage1.pth"
 stage1_checkpoint_path = os.path.join(base_dir, stage1_checkpoint_name)
-
-# Final checkpoint for the end of Stage 2 (LoRA)
 final_checkpoint_name = "model.pth"
 final_checkpoint_path = os.path.join(base_dir, final_checkpoint_name)
 
-# ---------------------- Helper Functions (Included for self-containment) ----------------------
+# --- GLOBAL MODEL/OPTIMIZER DEFINITION (FIX for NameError in atexit) ---
+model = None 
+optimizer = None 
+best_val_loss = float('inf')
 
-# This function calculates the loss for a single batch.
-def calc_loss_batch(outputs, targets):
-    outputs = outputs.view(-1, outputs.size(-1))
-    targets = targets.view(-1)
-    loss = nn.functional.cross_entropy(outputs, targets, ignore_index=-1)
-    return loss
-
-# This is a more robust version of the calc_loss_loader function
-def calc_loss_loader(data_loader, model, device, num_batches=None):
-    total_loss = 0.0
-    num_batches_processed = 0
-    data_iterator = iter(data_loader)
-    while True:
-        if num_batches is not None and num_batches_processed >= num_batches:
-            break
-        try:
-            input_batch, _ = next(data_iterator)
-        except StopIteration:
-            break
-        input_batch = input_batch.to(device)
-        with torch.no_grad():
-            outputs = model(input_batch[:, :-1])
-            loss = calc_loss_batch(outputs, input_batch[:, 1:])
-            total_loss += loss.item()
-            num_batches_processed += 1
-    if num_batches_processed > 0:
-        return total_loss / num_batches_processed
-    else:
-        return 0.0
-
-# This is a more robust version of the evaluate_model function
-def evaluate_model(model, train_loader, val_loader, device, eval_iter):
-    model.eval()
-    with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
-        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
-    model.train()
-    return train_loss, val_loss
-
-# This is a more robust version of the train_model_simple function
-def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
-                        eval_freq, eval_iter, start_context, tokenizer, checkpoint_path, 
-                        grad_accum_steps=4, best_val_loss=float('inf'), scheduler=None):
-    train_losses, val_losses, track_tokens_seen = [], [], []
-    tokens_seen, global_step = 0, -1
-    scaler = GradScaler()
-    for epoch in range(num_epochs):
-        model.train()
-        optimizer.zero_grad()
-        for step, (input_batch, target_batch) in enumerate(train_loader):
-            input_batch = input_batch.to(device)
-            inputs = input_batch[:, :-1]
-            targets = input_batch[:, 1:]
-            with autocast():
-                outputs = model(inputs)
-                loss = calc_loss_batch(outputs, targets)
-                loss = loss / grad_accum_steps
-            scaler.scale(loss).backward()
-            if (step + 1) % grad_accum_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                if scheduler:
-                    scheduler.step()
-            tokens_seen += input_batch.numel()
-            global_step += 1
-            if global_step % eval_freq == 0:
-                train_loss, val_loss = evaluate_model(
-                    model, train_loader, val_loader, device, eval_iter
-                )
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
-                track_tokens_seen.append(tokens_seen)
-                print(f"Ep {epoch+1} (Step {global_step:06d}): "
-                      f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    torch.save({
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'best_val_loss': best_val_loss,
-                        'epoch': epoch,
-                        'global_step': global_step
-                    }, checkpoint_path)
-    return train_losses, val_losses, track_tokens_seen
-
-
-def generate_and_print_sample(model, tokenizer, device, start_context):
-    model.eval()
-    context_size = model.pos_emb.weight.shape[0]
-    encoded = text_to_token_ids(start_context, tokenizer).to(device)
-    with torch.no_grad():
-        token_ids = generate(
-            model=model, idx=encoded,
-            max_new_tokens=50, context_size=context_size
-        )
-    decoded_text = token_ids_to_text(token_ids, tokenizer)
-    print(decoded_text.replace("\n", " "))
-    model.train()
-
-def text_to_token_ids(text, tokenizer):
-    return torch.tensor(tokenizer.encode(text))
-
-def token_ids_to_text(token_ids, tokenizer):
-    return tokenizer.decode(token_ids)
-
-
-# Note: The following imports are placeholders as the actual modules were not provided
-try:
-    from Instructional.model import GPTModel, CHOOSE_MODEL, BASE_CONFIG
-    from Instructional.Data.data_set import InstructionDataset
-    from Instructional.Data.collate import custom_collate_fn
-    from Instructional.Data.format import format_input
-    from Instructional.Accuracy.post_training import post_training_generate
-    from Instructional.Training.generate_text import generate
-    from GPT_Model.functions import text_to_token_ids, token_ids_to_text
-except ImportError:
-    print("Warning: Some modules could not be imported. Assuming they are available in your environment.")
-    
-# ---------------------- Backup Save Function ----------------------
 def backup_save():
-    print("\n❗ Detected interruption. Saving backup checkpoint...")
-    # Get the current model's state dict and optimizer state
-    model_state = model.state_dict()
-    optimizer_state = optimizer.state_dict()
-    best_loss = best_val_loss
-    
-    torch.save({
-        'model_state_dict': model_state,
-        'optimizer_state_dict': optimizer_state,
-        'best_val_loss': best_loss,
-    }, stage1_checkpoint_path)
-    print(f"✅ Backup saved to: {stage1_checkpoint_path}")
+    global model, optimizer, best_val_loss 
+    if model is not None and optimizer is not None:
+        print("\n❗ Detected interruption. Saving backup checkpoint...")
+        try:
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+            }, stage1_checkpoint_path)
+            print(f"✅ Backup saved to: {stage1_checkpoint_path}")
+        except Exception as e:
+            print(f"⚠️ Could not save backup state: {e}")
 
 atexit.register(backup_save)
 
@@ -215,9 +104,9 @@ test_dataset = InstructionDataset(test_data_json, tokenizer)
 customized_collate_fn = partial(custom_collate_fn, device=device, allowed_max_length=1024)
 batch_size = 4
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                         drop_last=True, num_workers=0, collate_fn=customized_collate_fn)
+                          drop_last=True, num_workers=0, collate_fn=customized_collate_fn)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                       drop_last=False, num_workers=0, collate_fn=customized_collate_fn)
+                        drop_last=False, num_workers=0, collate_fn=customized_collate_fn)
 print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}, Test size: {len(test_dataset)}")
 
 
@@ -228,11 +117,13 @@ print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}, Test siz
 if not os.path.exists(stage1_checkpoint_path):
     # ---------------------- STAGE 1: Full Fine-Tuning ----------------------
     print("\n--- Starting Stage 1: Full Fine-Tuning ---")
-    model = GPTModel(BASE_CONFIG)
-    model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
     
-    # You can adjust num_epochs_stage1 based on your GPU memory
+    # Initialize Writer for STAGE 1
+    log_path_s1 = os.path.join("runs", BASE_EXPERIMENT_NAME, STAGE1_RUN_NAME)
+    writer = SummaryWriter(log_path_s1)
+    
+    model = GPTModel(BASE_CONFIG).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
     num_epochs_stage1 = 2
     best_val_loss = float('inf')
 
@@ -243,7 +134,8 @@ if not os.path.exists(stage1_checkpoint_path):
             start_context=format_input(val_data_json[0]), tokenizer=tokenizer,
             checkpoint_path=stage1_checkpoint_path,
             grad_accum_steps=4,
-            best_val_loss=best_val_loss
+            best_val_loss=best_val_loss,
+            writer=writer 
         )
         print(f"✅ Stage 1 training completed. Final checkpoint saved to {stage1_checkpoint_path}.")
     except RuntimeError as e:
@@ -251,24 +143,33 @@ if not os.path.exists(stage1_checkpoint_path):
             print(f"❗ Stage 1 stopped due to out-of-memory error. Using latest checkpoint for Stage 2.")
         else:
             raise
+    finally:
+        writer.close()
     
-    # ---------------------- Transition to Stage 2 ----------------------
-    # If Stage 1 completed successfully, we will transition to Stage 2
-    # seamlessly by falling through to the next block.
 else:
     print(f"\n--- Stage 1 checkpoint found ({stage1_checkpoint_path}). Skipping to Stage 2 ---")
     
 # ---------------------- STAGE 2: LoRA Fine-Tuning ----------------------
-model = GPTModel(BASE_CONFIG)
+print("\n--- Starting Stage 2: LoRA Fine-Tuning ---")
+
+# Initialize Writer for STAGE 2
+log_path_s2 = os.path.join("runs", BASE_EXPERIMENT_NAME, STAGE2_RUN_NAME)
+writer = SummaryWriter(log_path_s2)
+
+model = GPTModel(BASE_CONFIG).to(device)
 
 try:
-    model.load_state_dict(torch.load(stage1_checkpoint_path, map_location=device)['model_state_dict'])
-    print(f"✅ Loaded Stage 1 checkpoint from {stage1_checkpoint_path} for LoRA fine-tuning.")
+    # --- FIX: strict=False added to bypass corrupt LoRA keys in Stage 1 checkpoint ---
+    model.load_state_dict(
+        torch.load(stage1_checkpoint_path, map_location=device)['model_state_dict'],
+        strict=False
+    )
+    print(f"✅ Loaded Stage 1 checkpoint from {stage1_checkpoint_path} for LoRA fine-tuning (ignoring extra keys).")
 except FileNotFoundError:
     print(f"Error: Stage 1 checkpoint not found at {stage1_checkpoint_path}. Exiting.")
     exit()
 
-# Apply LoRA layers to the loaded model
+# Apply LoRA layers
 for block in model.trf_blocks:
     if isinstance(block.att.W_query, nn.Linear):
         block.att.W_query = LoRALinear(block.att.W_query.in_features, block.att.W_query.out_features)
@@ -279,17 +180,16 @@ for block in model.trf_blocks:
     if isinstance(block.att.out_proj, nn.Linear):
         block.att.out_proj = LoRALinear(block.att.out_proj.in_features, block.att.out_proj.out_features)
 
-# Freeze all original parameters, keeping only LoRA layers trainable
+# Freeze all original parameters
 for name, param in model.named_parameters():
     if "A" not in name and "B" not in name:
         param.requires_grad = False
 
-# Re-initialize the optimizer with ONLY the trainable parameters
+# Re-initialize the optimizer
 optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                              lr=1e-3, weight_decay=0.01)
 
-# We can afford more epochs now due to less memory usage
-num_epochs_stage2 = 20
+num_epochs_stage2 = 10
 best_val_loss = float('inf')
 
 try:
@@ -299,12 +199,16 @@ try:
         start_context=format_input(val_data_json[0]), tokenizer=tokenizer,
         checkpoint_path=final_checkpoint_path,
         grad_accum_steps=4,
-        best_val_loss=best_val_loss
+        best_val_loss=best_val_loss,
+        writer=writer 
     )
     print(f"✅ Stage 2 training completed. Final checkpoint saved to {final_checkpoint_path}.")
 except Exception as e:
     print(f"An error occurred during Stage 2 training: {e}")
     exit()
+finally:
+    if writer is not None:
+        writer.close() 
 
 # -----------------------------------------------------------
 # 🔹 Post-Training Generation and Evaluation
@@ -325,4 +229,3 @@ test_data_json = post_training_generate(model, tokenizer, device, test_data_json
 with open(output_path, "w") as f:
     json.dump(test_data_json, f, indent=4)
 print(f"Responses saved at {output_path}")
-
